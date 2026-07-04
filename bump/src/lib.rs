@@ -60,8 +60,6 @@ mod tests {
 
     #[test]
     fn test_alloc_alignment() {
-        let mut buffer = [0u8; 1024];
-        let mut alloc = make_allocator(&mut buffer);
         for align in [1, 2, 4, 8, 16, 32, 64] {
             let mut buffer = [0u8; 1024];
             let mut alloc = make_allocator(&mut buffer);
