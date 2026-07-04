@@ -24,10 +24,6 @@ impl BumpAllocator {
             Some(ac) => ac,
             None => return std::ptr::null_mut(),
         };
-        println!(
-            "ALIGNED_CURSOR: {} FROM ORIGINAL CURSOR: {}",
-            aligned_cursor, self.cursor as usize
-        );
         let new_size = match aligned_cursor.checked_add(size) {
             Some(new_size) => new_size,
             None => return std::ptr::null_mut(),
@@ -37,7 +33,6 @@ impl BumpAllocator {
         }
         self.cursor = new_size as *mut u8;
         unsafe { self.start.add(aligned_cursor - self.start as usize) }
-        // aligned_cursor as *mut u8
     }
     fn align_up(&self, align: usize) -> Option<usize> {
         let check_curr = (self.cursor as usize).checked_add(align - 1)?;
@@ -55,7 +50,6 @@ mod tests {
         BumpAllocator::new(buffer)
     }
 
-    // 1. basic alloc returns non-null
     #[test]
     fn test_alloc_returns_nonnull() {
         let mut buffer = [0u8; 1024];
@@ -64,7 +58,6 @@ mod tests {
         assert!(!p.is_null());
     }
 
-    // 2. returned pointer is correctly aligned
     #[test]
     fn test_alloc_alignment() {
         let mut buffer = [0u8; 1024];
@@ -78,7 +71,6 @@ mod tests {
         }
     }
 
-    // 3. two allocations do not overlap
     #[test]
     fn test_no_overlap() {
         let mut buffer = [0u8; 1024];
@@ -90,7 +82,6 @@ mod tests {
         assert!(p2 as usize >= p1 as usize + 64);
     }
 
-    // 4. allocations are within buffer bounds
     #[test]
     fn test_within_bounds() {
         let mut buffer = [0u8; 1024];
@@ -101,7 +92,6 @@ mod tests {
         assert!(p as usize + 100 <= buffer.as_ptr() as usize + 1024);
     }
 
-    // 5. alloc past end returns null
     #[test]
     fn test_alloc_exhaustion() {
         let mut buffer = [0u8; 64];
@@ -112,7 +102,6 @@ mod tests {
         assert!(p2.is_null());
     }
 
-    // 6. reset allows reuse from start
     #[test]
     fn test_reset() {
         let mut buffer = [0u8; 1024];
@@ -125,7 +114,6 @@ mod tests {
         assert_eq!(p1, p2);
     }
 
-    // 7. multiple allocations fill buffer correctly
     #[test]
     fn test_fills_buffer() {
         let mut buffer = [0u8; 1024];
@@ -141,7 +129,6 @@ mod tests {
         assert_eq!(count, 16);
     }
 
-    // 8. write and read back through pointer
     #[test]
     fn test_write_read() {
         let mut buffer = [0u8; 1024];
@@ -154,7 +141,6 @@ mod tests {
         }
     }
 
-    // 9. zero size alloc returns null
     #[test]
     fn test_zero_size() {
         let mut buffer = [0u8; 1024];
@@ -163,7 +149,6 @@ mod tests {
         assert!(p.is_null());
     }
 
-    // 10. large alignment handled correctly
     #[test]
     fn test_large_alignment() {
         let mut buffer = [0u8; 4096];
@@ -173,7 +158,6 @@ mod tests {
         assert_eq!(p as usize % 256, 0);
     }
 
-    // 11. alignment padding does not leak into next allocation
     #[test]
     fn test_alignment_padding() {
         let mut buffer = [0u8; 1024];
@@ -186,7 +170,6 @@ mod tests {
         assert!(p2 as usize > p1 as usize);
     }
 
-    // 12. reset then fill again works correctly
     #[test]
     fn test_reset_and_refill() {
         let mut buffer = [0u8; 1024];
