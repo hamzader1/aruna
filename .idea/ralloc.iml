@@ -2,7 +2,9 @@
 <module type="EMPTY_MODULE" version="4">
   <component name="NewModuleRootManager">
     <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/arena/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/bump/src" isTestSource="false" />
+      <excludeFolder url="file://$MODULE_DIR$/arena/target" />
       <excludeFolder url="file://$MODULE_DIR$/bump/target" />
     </content>
     <orderEntry type="inheritedJdk" />
