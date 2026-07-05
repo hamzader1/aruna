@@ -3,7 +3,8 @@
 /bump/src/target/
 /bump/.DS_Store
 /bump/
-/arena/src/main
+/arena/src/main.rs
 /arena/src/target/
+/.idea/
 
 .DS_Store

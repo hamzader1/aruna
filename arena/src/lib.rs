@@ -89,7 +89,7 @@ impl Arena {
 
         let ptr = Platform::mmap(new_block_size);
         if ptr.is_null() {
-            panic!("FAILS TO ALLOCATE MORE MEMORY");
+            panic!("FAILED TO ALLOCATE MORE MEMORY");
         }
         let new_block_header = BlockHeader::new(prev_block_header, ptr, new_block_size);
         self.end = unsafe { ptr.add(new_block_size) };
