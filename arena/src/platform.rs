@@ -15,3 +15,8 @@ const FD: c_int = -1;
 const OFFSET: off_t = 0;
 
 pub struct Platform;
+impl Platform {
+    pub fn get_page_size() -> usize {
+        unsafe { sysconf(_SC_PAGE_SIZE) as usize }
+    }
+}
