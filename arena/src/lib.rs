@@ -41,6 +41,7 @@ impl Arena {
         arena.write_metadata(block_header);
         arena
     }
+
     pub fn alloc(&mut self, layout: std::alloc::Layout) -> *mut u8 {
         let (size, align) = (layout.size(), layout.align());
         if size == 0 {
@@ -61,7 +62,8 @@ impl Arena {
             self.grow(size);
             return self.alloc(layout);
         }
-        self.cursor = new_block_size as *mut u8;
+
+        self.cursor = unsafe { self.cursor.add(new_block_size - self.cursor as usize) };
         unsafe {
             let current_block_ptr = (*self.current_block).mmap_ptr;
             current_block_ptr.add(aligned_cursor - current_block_ptr as usize)
@@ -106,13 +108,19 @@ impl Arena {
     }
 }
 
+impl std::default::Default for Arena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn write_metadata_places_header_at_mmap_ptr_and_aligns_cursor() {
-        let mut arena = Arena::new();
+        let arena = Arena::new();
 
         // header should live at the very start of the chunk
         let mmap_ptr = unsafe { (*arena.current_block).mmap_ptr };
