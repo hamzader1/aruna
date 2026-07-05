@@ -252,4 +252,49 @@ mod tests {
         let new_size = unsafe { (*arena.current_block).mmap_size };
         assert_eq!(new_size, first_size * 2);
     }
+    #[test]
+    fn alloc_cursor_accounts_for_alignment_padding() {
+        let mut arena = Arena::new();
+
+        // Step 1: force cursor to an oddly-unaligned position.
+        // Alloc 3 bytes with align=1 -- guarantees no padding was added here,
+        // so afterward self.cursor sits at some address with no particular alignment.
+        let odd_layout = std::alloc::Layout::from_size_align(3, 1).unwrap();
+        let odd_ptr = arena.alloc(odd_layout);
+        assert!(!odd_ptr.is_null());
+
+        let cursor_after_odd = arena.cursor as usize;
+
+        // Step 2: alloc something that requires real alignment padding.
+        // If cursor_after_odd isn't already a multiple of 32, this forces padding.
+        let big_align_layout = std::alloc::Layout::from_size_align(64, 32).unwrap();
+        let big_ptr = arena.alloc(big_align_layout);
+        assert!(!big_ptr.is_null());
+
+        // Compute what SHOULD have happened, independently, using the same
+        // align_up logic the allocator itself uses.
+        let expected_aligned = Arena::align_up(cursor_after_odd, 32).unwrap();
+        let expected_new_cursor = expected_aligned + 64;
+
+        // 1. Returned pointer must be at the correctly aligned address, not raw cursor.
+        assert_eq!(big_ptr as usize, expected_aligned);
+        assert_eq!(big_ptr as usize % 32, 0);
+
+        // 2. Cursor after the alloc must equal aligned_start + size --
+        //    NOT old_cursor + size (which is the buggy formula).
+        assert_eq!(arena.cursor as usize, expected_new_cursor);
+
+        // 3. The two allocated regions must not overlap:
+        //    odd_ptr..odd_ptr+3 must end before big_ptr starts.
+        assert!(odd_ptr as usize + 3 <= big_ptr as usize);
+
+        // 4. Sanity: if there WAS padding (cursor wasn't already 32-aligned),
+        //    prove it's nonzero, so this test is actually exercising the bug path
+        //    and not accidentally testing the zero-padding case.
+        let padding = expected_aligned - cursor_after_odd;
+        assert!(
+            padding > 0,
+            "test didn't actually exercise padding -- cursor was already aligned by luck, rerun/adjust sizes"
+        );
+    }
 }
