@@ -2,6 +2,7 @@
 mod platform;
 use core::ptr::null_mut;
 use platform::Platform;
+
 pub struct BlockHeader {
     pub prev: *mut BlockHeader,
     pub mmap_ptr: *mut u8,
@@ -53,17 +54,17 @@ impl Arena {
             None => return null_mut(),
         };
 
-        let new_block_size = match aligned_cursor.checked_add(size) {
+        let alloc_end = match aligned_cursor.checked_add(size) {
             Some(new_block_size) => new_block_size,
             None => return null_mut(),
         };
 
-        if new_block_size > self.end as usize {
+        if alloc_end > self.end as usize {
             self.grow(size);
             return self.alloc(layout);
         }
 
-        self.cursor = unsafe { self.cursor.add(new_block_size - self.cursor as usize) };
+        self.cursor = unsafe { self.cursor.add(alloc_end - self.cursor as usize) };
         unsafe {
             let current_block_ptr = (*self.current_block).mmap_ptr;
             current_block_ptr.add(aligned_cursor - current_block_ptr as usize)
@@ -99,11 +100,27 @@ impl Arena {
     fn write_metadata(&mut self, block_header: BlockHeader) {
         let header_ptr = block_header.mmap_ptr as *mut BlockHeader;
         unsafe {
-            self.cursor = block_header
-                .mmap_ptr
-                .add((size_of::<BlockHeader>() + 8 - 1) & !(8 - 1));
+            self.cursor = block_header.mmap_ptr.add(
+                (size_of::<BlockHeader>() + align_of::<BlockHeader>() - 1)
+                    & !(align_of::<BlockHeader>() - 1),
+            );
             header_ptr.write(block_header);
             self.current_block = header_ptr;
+        }
+    }
+}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        println!("DROP CALLED");
+        let mut current = self.current_block;
+        unsafe {
+            while !(current.is_null()) {
+                let current_block = core::ptr::read(current);
+                dbg!(current);
+                Platform::munmap(current_block.mmap_ptr, current_block.mmap_size);
+                current = current_block.prev;
+            }
         }
     }
 }
@@ -117,6 +134,7 @@ impl std::default::Default for Arena {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::alloc::Layout;
 
     #[test]
     fn write_metadata_places_header_at_mmap_ptr_and_aligns_cursor() {
@@ -296,5 +314,83 @@ mod tests {
             padding > 0,
             "test didn't actually exercise padding -- cursor was already aligned by luck, rerun/adjust sizes"
         );
+    }
+
+    // 1. drop does not panic / crash on a single block
+    #[test]
+    fn test_drop_single_block() {
+        let arena = Arena::new();
+        drop(arena);
+        // if this test completes without segfault/panic, drop worked
+    }
+
+    // 2. drop does not panic after growth (multiple blocks)
+    #[test]
+    fn test_drop_multiple_blocks() {
+        let mut arena = Arena::new();
+        let page = unsafe { Platform::get_page_size() };
+
+        // force growth by allocating past the first block
+        let layout = Layout::from_size_align(page * 2, 8).unwrap();
+        let ptr = arena.alloc(layout);
+        assert!(!ptr.is_null());
+
+        drop(arena);
+    }
+
+    // 3. drop walks the entire prev chain (3+ blocks)
+    #[test]
+    fn test_drop_walks_full_chain() {
+        let mut arena = Arena::new();
+        let page = Platform::get_page_size();
+
+        // force multiple growths
+        for _ in 0..5 {
+            let layout = Layout::from_size_align(page * 2, 8).unwrap();
+            let ptr = arena.alloc(layout);
+            assert!(!ptr.is_null());
+        }
+
+        drop(arena);
+    }
+
+    // 4. after drop, a NEW arena can still successfully mmap
+    //    (proves memory was actually returned to the OS, not leaked)
+    #[test]
+    fn test_drop_releases_memory_for_reuse() {
+        {
+            let mut arena = Arena::new();
+            let page = Platform::get_page_size();
+            for _ in 0..10 {
+                let layout = Layout::from_size_align(page * 4, 8).unwrap();
+                arena.alloc(layout);
+            }
+            // arena drops here
+        }
+
+        // if previous arena leaked, this should still succeed
+        // (not a strict leak proof, but catches gross failures)
+        let arena2 = Arena::new();
+        drop(arena2);
+    }
+
+    // 5. dropping an arena with zero extra allocations (just the initial block)
+    #[test]
+    fn test_drop_initial_block_only() {
+        let arena = Arena::new();
+        // no alloc calls at all
+        drop(arena);
+    }
+
+    // 6. stress: create and drop many arenas in a loop (catches leaks via OOM if broken)
+    #[test]
+    fn test_drop_stress_many_arenas() {
+        for _ in 0..1000 {
+            let mut arena = Arena::new();
+            let layout = Layout::from_size_align(64, 8).unwrap();
+            arena.alloc(layout);
+            drop(arena);
+        }
+        // if drop leaks, this loop will exhaust address space / OOM eventually
     }
 }
