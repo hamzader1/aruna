@@ -60,7 +60,7 @@ impl Arena {
         };
 
         if alloc_end > self.end as usize {
-            self.grow(size);
+            self.grow(size, align);
             return self.alloc(layout);
         }
 
@@ -75,11 +75,11 @@ impl Arena {
         let checked_cursor_alignment = size.checked_add(align - 1)?;
         Some(checked_cursor_alignment & !(align - 1))
     }
-    fn grow(&mut self, requested_size: usize) {
+    fn grow(&mut self, requested_size: usize, requested_align: usize) {
         let prev_block_header = self.current_block;
         let prev_block_size = unsafe { (*self.current_block).mmap_size };
         let aligned_requested_size = Self::align_up(
-            requested_size + size_of::<BlockHeader>(),
+            requested_size + size_of::<BlockHeader>() + (requested_align - 1),
             Platform::get_page_size(),
         )
         .expect("size overflow");
