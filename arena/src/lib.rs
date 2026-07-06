@@ -1,7 +1,7 @@
-#![allow(dead_code)]
 mod platform;
 use core::ptr::null_mut;
 use platform::Platform;
+use std::ptr;
 
 pub struct BlockHeader {
     pub prev: *mut BlockHeader,
@@ -108,16 +108,31 @@ impl Arena {
             self.current_block = header_ptr;
         }
     }
+    #[allow(dead_code)]
+    fn reset(&mut self) {
+        unsafe {
+            while !((*self.current_block).prev.is_null()) {
+                let current_block = ptr::read(self.current_block);
+                Platform::munmap(current_block.mmap_ptr, current_block.mmap_size);
+                self.current_block = current_block.prev;
+            }
+
+            let current = core::ptr::read(self.current_block);
+            self.cursor = current
+                .mmap_ptr
+                .add(Self::align_up(size_of::<BlockHeader>(), align_of::<BlockHeader>()).unwrap());
+
+            self.end = current.mmap_ptr.add(current.mmap_size);
+        }
+    }
 }
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        println!("DROP CALLED");
         let mut current = self.current_block;
         unsafe {
             while !(current.is_null()) {
                 let current_block = core::ptr::read(current);
-                dbg!(current);
                 Platform::munmap(current_block.mmap_ptr, current_block.mmap_size);
                 current = current_block.prev;
             }
@@ -328,7 +343,7 @@ mod tests {
     #[test]
     fn test_drop_multiple_blocks() {
         let mut arena = Arena::new();
-        let page = unsafe { Platform::get_page_size() };
+        let page = Platform::get_page_size();
 
         // force growth by allocating past the first block
         let layout = Layout::from_size_align(page * 2, 8).unwrap();
@@ -392,5 +407,146 @@ mod tests {
             drop(arena);
         }
         // if drop leaks, this loop will exhaust address space / OOM eventually
+    }
+
+    // simple xorshift PRNG so tests are deterministic and reproducible
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn range(&mut self, lo: u64, hi: u64) -> u64 {
+            lo + (self.next() % (hi - lo))
+        }
+    }
+
+    #[test]
+    fn stress_random_allocs_no_overlap() {
+        let mut arena = Arena::new();
+        let mut rng = Rng::new(0xDEADBEEF);
+        // shadow: track every live allocation as (start, size)
+        let mut live: Vec<(usize, usize)> = Vec::new();
+
+        let iteration = if cfg!(miri) { 500 } else { 100_000 };
+        for i in 0..iteration {
+            let size = rng.range(1, 4096) as usize;
+            let align_pow = rng.range(0, 7) as u32; // 1,2,4,8,16,32,64
+            let align = 1usize << align_pow;
+
+            let layout = Layout::from_size_align(size, align).unwrap();
+            let ptr = arena.alloc(layout);
+
+            assert!(!ptr.is_null(), "alloc failed at iteration {}", i);
+
+            let addr = ptr as usize;
+
+            // alignment check
+            assert_eq!(addr % align, 0, "misaligned at iter {}: align={}", i, align);
+
+            // overlap check against every previous live allocation
+            for &(start, sz) in &live {
+                let overlaps = addr < start + sz && start < addr + size;
+                assert!(
+                    !overlaps,
+                    "OVERLAP at iter {}: new=({:#x},{}) vs existing=({:#x},{})",
+                    i, addr, size, start, sz
+                );
+            }
+
+            // write a pattern derived from the pointer itself, into every byte
+            unsafe {
+                for b in 0..size {
+                    *ptr.add(b) = (addr as u8).wrapping_add(b as u8);
+                }
+            }
+
+            live.push((addr, size));
+        }
+
+        // after all allocations, verify every write is still intact
+        // (arena never frees individually, so nothing should have been corrupted)
+        for &(start, size) in &live {
+            unsafe {
+                let ptr = start as *mut u8;
+                for b in 0..size {
+                    let expected = (start as u8).wrapping_add(b as u8);
+                    assert_eq!(
+                        *ptr.add(b),
+                        expected,
+                        "CORRUPTION at addr {:#x} byte {}",
+                        start,
+                        b
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stress_reset_and_refill_cycles() {
+        let mut arena = Arena::new();
+        let mut rng = Rng::new(12345);
+
+        for _cycle in 0..1000 {
+            let mut live: Vec<(usize, usize)> = Vec::new();
+
+            for _ in 0..50 {
+                let size = rng.range(1, 512) as usize;
+                let align = 1usize << rng.range(0, 6);
+                let layout = Layout::from_size_align(size, align).unwrap();
+                let ptr = arena.alloc(layout);
+                assert!(!ptr.is_null());
+                let addr = ptr as usize;
+
+                for &(start, sz) in &live {
+                    let overlaps = addr < start + sz && start < addr + size;
+                    assert!(!overlaps);
+                }
+                live.push((addr, size));
+            }
+
+            arena.reset();
+        }
+    }
+
+    #[test]
+    fn stress_growth_many_blocks() {
+        let mut arena = Arena::new();
+        let page = Platform::get_page_size();
+
+        // deliberately force many growth events
+        for i in 0..200 {
+            let size = page * 3; // bigger than initial block every time
+            let layout = Layout::from_size_align(size, 8).unwrap();
+            let ptr = arena.alloc(layout);
+            assert!(!ptr.is_null(), "failed to grow at iteration {}", i);
+        }
+    }
+
+    #[test]
+    fn stress_extreme_alignments() {
+        let mut arena = Arena::new();
+        for &align in &[1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096] {
+            let layout = Layout::from_size_align(8, align).unwrap();
+            let ptr = arena.alloc(layout);
+            assert!(!ptr.is_null());
+            assert_eq!(ptr as usize % align, 0);
+        }
+    }
+
+    #[test]
+    fn stress_create_and_drop_many_arenas() {
+        for _ in 0..5000 {
+            let mut arena = Arena::new();
+            let layout = Layout::from_size_align(128, 8).unwrap();
+            arena.alloc(layout);
+            drop(arena);
+        }
     }
 }
