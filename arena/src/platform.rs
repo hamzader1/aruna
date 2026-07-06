@@ -7,6 +7,8 @@ use libc::MAP_PRIVATE;
 use libc::PROT_READ;
 use libc::PROT_WRITE;
 use libc::c_int;
+use libc::c_void;
+use libc::munmap;
 use libc::off_t;
 use libc::sysconf;
 
@@ -30,6 +32,11 @@ impl Platform {
             } else {
                 ptr as *mut u8
             }
+        }
+    }
+    pub fn munmap<T>(addr: *mut T, size: usize) {
+        unsafe {
+            munmap(addr as *mut c_void, size);
         }
     }
 }
