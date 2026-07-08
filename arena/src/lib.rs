@@ -4,15 +4,24 @@ use platform::Platform;
 use std::ptr;
 
 pub struct BlockHeader {
-    pub prev: *mut BlockHeader,
-    pub mmap_ptr: *mut u8,
-    pub mmap_size: usize,
+    prev: *mut BlockHeader,
+    mmap_ptr: *mut u8,
+    mmap_size: usize,
 }
 pub struct Arena {
-    pub current_block: *mut BlockHeader,
-    pub cursor: *mut u8,
-    pub end: *mut u8,
+    current_block: *mut BlockHeader,
+    cursor: *mut u8,
+    end: *mut u8,
 }
+
+struct EmptyBlockWrapper(BlockHeader);
+unsafe impl Sync for EmptyBlockWrapper {}
+
+static EMPTY_BLOCK: EmptyBlockWrapper = EmptyBlockWrapper(BlockHeader {
+    prev: core::ptr::null_mut(),
+    mmap_ptr: core::ptr::null_mut(),
+    mmap_size: 0,
+});
 
 impl BlockHeader {
     fn new(prev: *mut BlockHeader, mmap_ptr: *mut u8, mmap_size: usize) -> Self {
