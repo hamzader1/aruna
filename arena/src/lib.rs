@@ -39,6 +39,15 @@ impl BlockHeader {
             mmap_size,
         }
     }
+    fn prev_ptr(&self) -> *mut BlockHeader {
+        self.prev
+    }
+    fn ptr(&self) -> *mut u8 {
+        self.mmap_ptr
+    }
+    fn size(&self) -> usize {
+        self.mmap_size
+    }
 }
 
 impl Arena {
