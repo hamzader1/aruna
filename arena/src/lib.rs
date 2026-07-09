@@ -119,6 +119,7 @@ impl Arena {
             _ => aligned_requested_size,
         };
 
+    fn new_block(&mut self, new_block_size: usize, prev_block_header: *mut BlockHeader) {
         let ptr = Platform::mmap(new_block_size);
         if ptr.is_null() {
             panic!("FAILED TO ALLOCATE MORE MEMORY");
