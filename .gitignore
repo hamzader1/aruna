@@ -1,10 +1,10 @@
 /target
 /bump/src/main.rs
-/bump/src/target/
+/bump/target/
 /bump/.DS_Store
 /bump/
 /arena/src/main.rs
-/arena/src/target/
+/arena/target/
 /.idea/
 
 .DS_Store
