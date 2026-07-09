@@ -78,7 +78,7 @@ impl Arena {
 
         let aligned_cursor = match Self::align_up(self.cursor as usize, align) {
             Some(ac) => ac,
-            None => return null_mut(),
+            _ => return null_mut(),
         };
 
         let alloc_end = match aligned_cursor.checked_add(size) {
@@ -89,7 +89,7 @@ impl Arena {
         if alloc_end > self.end as usize {
             self.grow(size, align);
             return self.alloc(layout);
-        }
+        } // else fast path
 
         self.cursor = unsafe { self.cursor.add(alloc_end - self.cursor as usize) };
         unsafe {
@@ -116,7 +116,7 @@ impl Arena {
         .expect("size overflow");
         let new_block_size = match prev_block_size.checked_mul(2) {
             Some(d) => d.max(aligned_requested_size),
-            None => aligned_requested_size,
+            _ => aligned_requested_size,
         };
 
         let ptr = Platform::mmap(new_block_size);
