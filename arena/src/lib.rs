@@ -71,6 +71,7 @@ impl Arena {
 
     pub fn alloc(&mut self, layout: std::alloc::Layout) -> *mut u8 {
         let (size, align) = (layout.size(), layout.align());
+        debug_assert!(align & (align - 1) == 0, "Assertion failed: Alignment ({}) must be a power of two", align);
         if size == 0 {
             return null_mut();
         }
