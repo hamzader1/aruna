@@ -118,6 +118,8 @@ impl Arena {
             Some(d) => d.max(aligned_requested_size),
             _ => aligned_requested_size,
         };
+        Self::new_block(self, new_block_size, prev_block_header);
+    }
 
     fn new_block(&mut self, new_block_size: usize, prev_block_header: *mut BlockHeader) {
         let ptr = Platform::mmap(new_block_size);
