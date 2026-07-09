@@ -23,6 +23,14 @@ static EMPTY_BLOCK: EmptyBlockWrapper = EmptyBlockWrapper(BlockHeader {
     mmap_size: 0,
 });
 
+impl EmptyBlockWrapper {
+    pub fn get(&self) -> *mut BlockHeader {
+        &self.0 as *const BlockHeader as *mut BlockHeader
+    }
+    pub fn get_ptr(&self) -> *mut u8 {
+        self.0.mmap_ptr
+    }
+}
 impl BlockHeader {
     fn new(prev: *mut BlockHeader, mmap_ptr: *mut u8, mmap_size: usize) -> Self {
         Self {
