@@ -232,7 +232,7 @@ impl Drop for Arena {
     fn drop(&mut self) {
         let mut current = self.current_block;
         unsafe {
-            while !(current.is_null()) {
+            while current != EMPTY_BLOCK.get() {
                 let current_block = core::ptr::read(current);
                 Platform::munmap(current_block.ptr(), current_block.size());
                 current = current_block.prev;
