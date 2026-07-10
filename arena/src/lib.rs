@@ -222,6 +222,27 @@ impl Arena {
     pub fn align_up_unchecked(size: usize, align: usize) -> usize {
         (size + align - 1) & !(align - 1)
     }
+    pub fn is_last_allocation(&self, ptr: *mut u8, size: usize) -> bool {
+        unsafe { ptr == self.cursor.sub(size) }
+    }
+    pub fn grow(&mut self, ptr: *mut u8, old_layout: Layout, new_layout: Layout) -> *mut u8 {
+        // check if the align valid or not
+        let is_valid_align = old_layout.align() >= new_layout.align();
+        if is_valid_align && self.is_last_allocation(ptr, old_layout.size()) {
+            let delta = new_layout.size() - old_layout.size();
+            if let Some(_) = self.try_allocate_fast(delta, old_layout.align()) {
+                return ptr;
+            }
+        }
+        unsafe {
+            let new_ptr = self.alloc(Layout::from_size_align_unchecked(
+                new_layout.size(),
+                old_layout.size(),
+            ));
+            core::ptr::copy_nonoverlapping(ptr, new_ptr, old_layout.size());
+            return new_ptr;
+        }
+    }
 }
 
 impl Drop for Arena {
