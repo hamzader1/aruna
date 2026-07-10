@@ -8,17 +8,17 @@ use core::ptr::null_mut;
 use platform::Platform;
 #[derive(Debug)]
 pub struct BlockHeader {
-    prev: *mut BlockHeader,
-    mmap_ptr: *mut u8,
-    mmap_size: usize,
+    pub prev: *mut BlockHeader,
+    pub mmap_ptr: *mut u8,
+    pub mmap_size: usize,
 }
 
 #[derive(Debug)]
 pub struct Arena {
-    current_block: *mut BlockHeader,
-    cursor: *mut u8,
-    end: *mut u8,
-    double_allowed: bool,
+    pub current_block: *mut BlockHeader,
+    pub cursor: *mut u8,
+    pub end: *mut u8,
+    pub double_allowed: bool,
 }
 pub struct EmptyBlockWrapper(BlockHeader);
 unsafe impl Sync for EmptyBlockWrapper {}
@@ -177,8 +177,9 @@ impl Arena {
         unsafe {
             self.deallocate_blocks_until_stop((*self.current_block).prev(), EMPTY_BLOCK.get());
             self.reset_cursor_to(&*self.current_block);
-            self.double_allowed = false;
+            (*self.current_block).prev = EMPTY_BLOCK.get();
         }
+        self.double_allowed = false;
     }
 
     fn deallocate_blocks_until_stop(
