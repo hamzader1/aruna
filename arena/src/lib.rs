@@ -120,10 +120,16 @@ impl Arena {
             Platform::get_page_size(),                     // align to page_size (4KIB on Linux)
         )
         .unwrap_or_else(|| AllocatorError::Overflow.panic());
-        let new_block_size = match prev_block_size.checked_mul(2) {
-            Some(d) => d.max(aligned_requested_size),
-            _ => aligned_requested_size,
-        };
+        let new_block_size;
+        if self.double_allowed {
+            new_block_size = match prev_block_size.checked_mul(2) {
+                Some(d) => d.max(aligned_requested_size),
+                _ => aligned_requested_size,
+            };
+        } else {
+            new_block_size = aligned_requested_size.max(Platform::get_page_size());
+            self.double_allowed = true
+        }
         match Self::new_block(self, new_block_size, prev_block_header) {
             Ok(_) => Ok(self.try_allocate_fast(size, align).unwrap()),
             Err(allocerr) => Err(allocerr),
