@@ -1,3 +1,4 @@
+#![allow(warnings)]
 mod alloc;
 mod platform;
 mod tests;
@@ -45,7 +46,7 @@ impl BlockHeader {
             mmap_size,
         }
     }
-    fn prev_ptr(&self) -> *mut BlockHeader {
+    fn prev(&self) -> *mut BlockHeader {
         self.prev
     }
     fn ptr(&self) -> *mut u8 {
@@ -69,7 +70,16 @@ impl Arena {
     pub fn alloc(&mut self, layout: Layout) -> *mut u8 {
         Self::try_allocate(self, layout).unwrap_or_else(|err| err.panic())
     }
-    
+
+    pub fn alloc_val<T>(&mut self, val: T) -> *mut T {
+        let layout = Layout::new::<T>();
+        let ptr = self.alloc(layout) as *mut T;
+        unsafe {
+            ptr.write(val);
+        }
+        ptr
+    }
+
     pub fn try_allocate(&mut self, layout: Layout) -> Result<*mut u8, AllocatorError> {
         let (size, align) = (layout.size(), layout.align());
         debug_assert!(
@@ -122,6 +132,7 @@ impl Arena {
         .unwrap_or_else(|| AllocatorError::Overflow.panic());
         let new_block_size;
         if self.double_allowed {
+            // if double is allowed, then try to double prev block size
             new_block_size = match prev_block_size.checked_mul(2) {
                 Some(d) => d.max(aligned_requested_size),
                 _ => aligned_requested_size,
@@ -135,32 +146,6 @@ impl Arena {
             Err(allocerr) => Err(allocerr),
         }
     }
-
-    pub fn align_up(size: usize, align: usize) -> Option<usize> {
-        let checked_cursor_alignment = size.checked_add(align - 1)?;
-        Some(checked_cursor_alignment & !(align - 1))
-    }
-
-    pub fn align_up_unchecked(size: usize, align: usize) -> usize {
-        (size + align - 1) & !(align - 1)
-    }
-    // fn grow(&mut self, size: usize, align: usize) {
-    //     let prev_block_header = self.current_block;
-    //     let prev_block_size = unsafe { (*self.current_block).size() };
-    //     let aligned_requested_size = Self::align_up(
-    //         size + size_of::<BlockHeader>() + (align - 1), // total size
-    //         Platform::get_page_size(),                     // align to page_size (4KIB on Linux)
-    //     )
-    //     .expect("size overflow"); // TODO: Simple error handling for now
-    //     let new_block_size = match prev_block_size.checked_mul(2) {
-    //         Some(d) => d.max(aligned_requested_size),
-    //         _ => aligned_requested_size,
-    //     };
-    //     // match Self::new_block(self, new_block_size, prev_block_header) {
-    //     //     Ok(_) => self.try_allocate_fast(size, align).unwrap_or(AllocatorError::AllocationFailed),
-    //     //     _ => panic!()
-    //     // }
-    // }
 
     fn new_block(
         &mut self,
@@ -181,26 +166,21 @@ impl Arena {
     fn write_metadata(&mut self, block_header: BlockHeader) {
         let header_ptr = block_header.ptr() as *mut BlockHeader;
         unsafe {
-            // TODO: call align_up function
             //
             self.reset_cursor_to(&block_header);
-            // self.cursor = block_header.ptr().add(Self::align_up_unchecked(
-            //     size_of::<BlockHeader>(),
-            //     align_of::<BlockHeader>(),
-            // ));
             header_ptr.write(block_header);
             self.current_block = header_ptr;
         }
     }
-    #[allow(dead_code)]
-    // TODO: Fix Links
-    fn reset(&mut self) {
+
+    pub fn reset(&mut self) {
         unsafe {
             self.deallocate_blocks_until_stop((*self.current_block).prev(), EMPTY_BLOCK.get());
             self.reset_cursor_to(&*self.current_block);
             self.double_allowed = false;
         }
     }
+
     fn deallocate_blocks_until_stop(
         &mut self,
         current_block: *mut BlockHeader,
@@ -210,14 +190,16 @@ impl Arena {
         while curr_block != stop_block {
             unsafe {
                 let prev = (*curr_block).prev();
-                self.dealloc_single_block(&*curr_block);
+                self.dealloc(&*curr_block);
                 curr_block = prev;
             }
         }
     }
-    fn dealloc_single_block(&self, block: &BlockHeader) {
+
+    fn dealloc(&self, block: &BlockHeader) {
         Platform::munmap(block.ptr(), block.size());
     }
+
     fn reset_cursor_to(&mut self, block: &BlockHeader) {
         unsafe {
             self.cursor = block.ptr().add(Self::align_up_unchecked(
@@ -226,13 +208,14 @@ impl Arena {
             ))
         }
     }
-    pub fn alloc_val<T>(&mut self, val: T) -> *mut T {
-        let layout = Layout::new::<T>();
-        let ptr = self.alloc(layout) as *mut T;
-        unsafe {
-            ptr.write(val);
-        }
-        ptr
+
+    pub fn align_up(size: usize, align: usize) -> Option<usize> {
+        let checked_cursor_alignment = size.checked_add(align - 1)?;
+        Some(checked_cursor_alignment & !(align - 1))
+    }
+
+    pub fn align_up_unchecked(size: usize, align: usize) -> usize {
+        (size + align - 1) & !(align - 1)
     }
 }
 

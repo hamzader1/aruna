@@ -26,7 +26,7 @@ impl Platform {
         unsafe {
             let ptr = libc::mmap(null_mut(), size, PROT, FLAG, FD, OFFSET);
             if ptr == MAP_FAILED {
-                eprintln!("mmap failed: {}", std::io::Error::last_os_error());
+                // eprintln!("mmap failed: {}", std::io::Error::last_os_error());
                 null_mut()
             } else {
                 ptr as *mut u8
