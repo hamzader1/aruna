@@ -190,18 +190,33 @@ impl Arena {
     // TODO: Fix Links
     fn reset(&mut self) {
         unsafe {
-            while !((*self.current_block).prev_ptr().is_null()) {
-                let current_block = core::ptr::read(self.current_block);
-                Platform::munmap(current_block.ptr(), current_block.size());
-                self.current_block = current_block.prev;
+            self.deallocate_blocks_until_stop((*self.current_block).prev(), EMPTY_BLOCK.get());
+            self.reset_cursor_to(&*self.current_block);
+        }
+    }
+    fn deallocate_blocks_until_stop(
+        &mut self,
+        current_block: *mut BlockHeader,
+        stop_block: *mut BlockHeader,
+    ) {
+        let mut curr_block = current_block;
+        while curr_block != stop_block {
+            unsafe {
+                let prev = (*curr_block).prev();
+                self.dealloc_single_block(&*curr_block);
+                curr_block = prev;
             }
-
-            let current = core::ptr::read(self.current_block);
-            self.cursor = current
-                .mmap_ptr
-                .add(Self::align_up(size_of::<BlockHeader>(), align_of::<BlockHeader>()).unwrap());
-
-            self.end = current.ptr().add(current.mmap_size);
+        }
+    }
+    fn dealloc_single_block(&self, block: &BlockHeader) {
+        Platform::munmap(block.ptr(), block.size());
+    }
+    fn reset_cursor_to(&mut self, block: &BlockHeader) {
+        unsafe {
+            self.cursor = block.ptr().add(Self::align_up_unchecked(
+                size_of::<BlockHeader>(),
+                align_of::<BlockHeader>(),
+            ))
         }
     }
 }
