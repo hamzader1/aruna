@@ -192,6 +192,7 @@ impl Arena {
         unsafe {
             self.deallocate_blocks_until_stop((*self.current_block).prev(), EMPTY_BLOCK.get());
             self.reset_cursor_to(&*self.current_block);
+            self.double_allowed = false;
         }
     }
     fn deallocate_blocks_until_stop(
