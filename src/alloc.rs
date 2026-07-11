@@ -19,6 +19,9 @@ pub enum AllocatorError {
     /// Arithmetic overflow occurred while computing sizes, alignments, or
     /// cursor positions.
     Overflow,
+
+    /// Growing an existing allocation to the requested layout failed.
+    GrowFailed,
 }
 impl AllocatorError {
     /// Converts an allocator error into a panic.
@@ -44,6 +47,9 @@ impl std::fmt::Display for AllocatorError {
             }
             Self::Overflow => {
                 write!(f, "arithmetic overflow while calculating allocation size")
+            }
+            &Self::GrowFailed => {
+                write!(f, "allocation could not be resized in place, and allocating a replacement block failed.")
             }
         }
     }
