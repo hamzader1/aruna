@@ -235,10 +235,7 @@ impl Arena {
             }
         }
         unsafe {
-            let new_ptr = self.alloc(Layout::from_size_align_unchecked(
-                new_layout.size(),
-                old_layout.size(),
-            ));
+            let new_ptr = self.alloc(new_layout);
             core::ptr::copy_nonoverlapping(ptr, new_ptr, old_layout.size());
             return new_ptr;
         }
