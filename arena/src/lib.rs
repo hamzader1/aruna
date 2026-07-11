@@ -248,7 +248,15 @@ impl Arena {
             new_layout.size() <= old_layout.size() && old_layout.align() >= new_layout.align();
         if is_valid_to_shrink && self.is_last_allocation(ptr, old_layout.size()) {
             let delta = old_layout.size() - new_layout.size();
-            unsafe { self.cursor = self.cursor.sub(delta) }
+
+            unsafe {
+                let new_cursor = self.cursor.sub(delta);
+                debug_assert!(
+                    new_cursor as usize >= (*self.current_block).mmap_ptr as usize,
+                    "shrink would move cursor before the start of the current block"
+                );
+                self.cursor = new_cursor;
+            }
         }
     }
 }
