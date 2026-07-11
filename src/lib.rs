@@ -30,14 +30,14 @@ use platform::Platform;
 pub struct BlockHeader {
     /// Previous block in the arena chain, or `EMPTY_BLOCK` for the first real
     /// block.
-    pub prev: *mut BlockHeader,
+    pub(crate) prev: *mut BlockHeader,
 
     /// Pointer returned by the platform mapping call.
-    pub mmap_ptr: *mut u8,
+    pub(crate) mmap_ptr: *mut u8,
 
     /// Total size of the mapped block, including the header and user payload
     /// area.
-    pub mmap_size: usize,
+    pub(crate) mmap_size: usize,
 }
 
 ///
@@ -49,13 +49,13 @@ pub struct BlockHeader {
 #[derive(Debug)]
 pub struct Arena {
     /// Header for the block that receives new allocations.
-    pub current_block: *mut BlockHeader,
+    pub(crate) current_block: *mut BlockHeader,
 
     /// Next allocation position inside the current block.
-    pub cursor: *mut u8,
+    pub(crate) cursor: *mut u8,
 
     /// One-past-the-end pointer for the current block.
-    pub end: *mut u8,
+    pub(crate) end: *mut u8,
 
     /// Controls whether the next growth should double the current block size.
     ///
@@ -382,8 +382,10 @@ impl Arena {
     /// state.
     pub fn clear(&mut self) {
         self.deallocate_blocks_until_stop(self.current_block, EMPTY_BLOCK.get());
+        self.current_block = EMPTY_BLOCK.get();
         self.cursor = EMPTY_BLOCK.get_ptr();
         self.end = EMPTY_BLOCK.get_ptr();
+        self.double_allowed = true
     }
 
     /// Rounds `size` up to the next multiple of `align`.
@@ -423,8 +425,28 @@ impl Arena {
     /// pointer is returned. The old allocation is not individually freed; it
     /// remains part of the arena until `reset`, `clear`, or `Drop`.
     ///
+    ///
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must refer to a live allocation made by this `Bump` using
+    /// `old_layout`. `new_layout` must describe the same allocation with a size
+    /// greater than or equal to `old_layout.size()` and an alignment no greater
+    /// than `old_layout.align()`.
+    ///
+    /// On the slow path, this function allocates a fresh allocation before
+    /// copying the existing bytes. The source and destination are therefore
+    /// guaranteed not to overlap, making the internal use of
+    /// `core::ptr::copy_nonoverlapping` sound.
+    ///
+    /// The old allocation remains part of the arena and is not individually
+    /// deallocated. It is invalidated only when the arena is reset, cleared, or
+    /// dropped.
+    ///
+    ///
+    ///
+    ///
     /*
-
     Attempts to grow the most recent allocation in place by extending it
     into adjacent free space within the current block. Only possible when
     `ptr` is the last allocation made and the alignment is compatible;
@@ -469,7 +491,7 @@ impl Arena {
      +------+-----+-----+------+------------------------+-----+
                    ^ old B bytes now wasted/unreachable
     */
-    pub fn grow(&mut self, ptr: *mut u8, old_layout: Layout, new_layout: Layout) -> *mut u8 {
+    pub unsafe fn grow(&mut self, ptr: *mut u8, old_layout: Layout, new_layout: Layout) -> *mut u8 {
         // check if the alin valid or not
         let is_valid_align = old_layout.align() >= new_layout.align();
         if is_valid_align && self.is_last_allocation(ptr, old_layout.size()) {
@@ -520,8 +542,6 @@ impl Arena {
 
 
     */
-    ///
-
     pub fn shrink(&mut self, ptr: *mut u8, old_layout: Layout, new_layout: Layout) -> *mut u8 {
         let is_valid_to_shrink =
             new_layout.size() <= old_layout.size() && old_layout.align() >= new_layout.align();
@@ -566,7 +586,7 @@ impl std::default::Default for Arena {
 #[cfg(test)]
 mod tests {
     use crate::alloc::AllocatorError;
-    use crate::{Arena, BlockHeader, Platform, EMPTY_BLOCK};
+    use crate::{Arena, BlockHeader, EMPTY_BLOCK, Platform};
     use std::alloc::Layout;
 
     #[test]
@@ -1716,7 +1736,7 @@ mod tests {
         let ptr = arena.alloc(old);
         let block = arena.current_block;
 
-        let grown = arena.grow(ptr, old, new);
+        let grown = unsafe { arena.grow(ptr, old, new) };
 
         assert_eq!(grown, ptr);
         assert_eq!(arena.current_block, block);
@@ -1736,7 +1756,7 @@ mod tests {
             }
         }
 
-        let grown = arena.grow(ptr, old, new);
+        let grown = unsafe { arena.grow(ptr, old, new) };
 
         assert_eq!(grown, ptr);
         unsafe {
@@ -1763,7 +1783,7 @@ mod tests {
             }
         }
 
-        let grown = arena.grow(first, old, new);
+        let grown = unsafe { arena.grow(first, old, new) };
 
         assert_ne!(grown, first);
         assert_no_overlap(
@@ -1796,7 +1816,7 @@ mod tests {
             }
         }
 
-        let grown = arena.grow(ptr, old, new);
+        let grown = unsafe { arena.grow(ptr, old, new) };
 
         assert_ne!(arena.current_block, old_block);
         unsafe {
@@ -1819,7 +1839,7 @@ mod tests {
             }
         }
 
-        let grown = arena.grow(ptr, old, new);
+        let grown = unsafe { arena.grow(ptr, old, new) };
 
         assert_eq!(grown as usize % 64, 0);
         unsafe {
@@ -1903,7 +1923,7 @@ mod tests {
         let ptr = arena.alloc(large);
 
         arena.shrink(ptr, large, small);
-        let grown = arena.grow(ptr, small, large);
+        let grown = unsafe { arena.grow(ptr, small, large) };
 
         assert_eq!(grown, ptr);
         assert_eq!(arena.cursor, unsafe { ptr.add(large.size()) });
@@ -1923,7 +1943,7 @@ mod tests {
             }
         }
 
-        let grown = arena.grow(ptr, old, new);
+        let grown = unsafe { arena.grow(ptr, old, new) };
 
         assert_ne!(grown, ptr);
         unsafe {
@@ -1949,7 +1969,7 @@ mod tests {
 
         for size in (16..4096).step_by(16) {
             let new_layout = Layout::from_size_align(size, 8).unwrap();
-            let grown = arena.grow(ptr, layout, new_layout);
+            let grown = unsafe { arena.grow(ptr, layout, new_layout) };
 
             assert_eq!(grown, ptr);
             unsafe {
@@ -1996,7 +2016,7 @@ mod tests {
 
         for (ptr, old, seed) in entries {
             let new = Layout::from_size_align(256, 8).unwrap();
-            let grown = arena.grow(ptr, old, new);
+            let grown = unsafe { arena.grow(ptr, old, new) };
 
             assert_ne!(grown, ptr);
             unsafe {
@@ -2020,7 +2040,7 @@ mod tests {
             let ptr = arena.alloc(old);
             let grow_size = old.size() + rng.range(1, 4096) as usize;
             let grown_layout = Layout::from_size_align(grow_size, align).unwrap();
-            let grown = arena.grow(ptr, old, grown_layout);
+            let grown = unsafe { arena.grow(ptr, old, grown_layout) };
             let shrink_size = rng.range(1, grown_layout.size() as u64) as usize;
             let shrunk_layout = Layout::from_size_align(shrink_size, align).unwrap();
 
@@ -2047,7 +2067,7 @@ mod tests {
                 }
             }
 
-            let grown = arena.grow(ptr, old, new);
+            let grown = unsafe { arena.grow(ptr, old, new) };
 
             unsafe {
                 for i in 0..old.size() {
@@ -2107,7 +2127,7 @@ mod tests {
                 }
             }
 
-            let grown = arena.grow(ptr, old, new);
+            let grown = unsafe { arena.grow(ptr, old, new) };
 
             unsafe {
                 for j in 0..old.size() {
@@ -2131,7 +2151,7 @@ mod tests {
         assert!(!arena.is_last_allocation(a, a_layout.size()));
         assert!(arena.is_last_allocation(b, b_layout.size()));
 
-        let b_grown = arena.grow(b, b_layout, c_layout);
+        let b_grown = unsafe { arena.grow(b, b_layout, c_layout) };
         assert_eq!(b_grown, b);
         assert!(arena.is_last_allocation(b, c_layout.size()));
 
