@@ -479,7 +479,9 @@ impl Arena {
             }
         }
         unsafe {
-            let new_ptr = self.alloc(new_layout);
+            let new_ptr = self
+                .try_allocate(new_layout)
+                .unwrap_or_else(|_| AllocatorError::GrowFailed.panic());
             core::ptr::copy_nonoverlapping(ptr, new_ptr, old_layout.size());
             new_ptr
         }
