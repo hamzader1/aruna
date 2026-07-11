@@ -1,28 +1,84 @@
 #![allow(warnings)]
+/// The allocator owns one or more memory blocks obtained from the platform
+/// layer. Each block stores a small header at the beginning of the mapping,
+/// followed by user allocations. Allocation is bump-style: the arena keeps a
+/// cursor inside the current block, aligns that cursor for each request, and
+/// advances it after a successful allocation.
+///
+/// When the current block cannot satisfy a request, the arena maps a new block
+/// and links it to the previous block. `reset` keeps the current block and
+/// releases older blocks, allowing the arena to cheaply reuse the largest
+/// recently needed allocation region. `Drop` releases every mapped block.
+///
+/// This arena does not run destructors for values stored inside it. Storing
+/// plain data and `Copy` values is the intended use. Values such as `String`,
+/// `Vec`, `Box`, or other types with ownership of external resources require
+/// separate destructor handling, which this allocator does not currently
+/// provide.
 mod alloc;
 mod platform;
 use alloc::AllocatorError;
 use core::alloc::Layout;
 use core::ptr::null_mut;
 use platform::Platform;
+
+/// Metadata stored at the beginning of every mapped arena block.
+///
+/// The header is stored in-band, meaning it lives inside the same memory
+/// mapping that later serves user allocations. `prev` links blocks backward so
+/// that `reset`, `clear`, and `Drop` can walk and release older mappings.
 #[derive(Debug)]
 pub struct BlockHeader {
+    /// Previous block in the arena chain, or `EMPTY_BLOCK` for the first real
+    /// block.
     pub prev: *mut BlockHeader,
+
+    /// Pointer returned by the platform mapping call.
     pub mmap_ptr: *mut u8,
+
+    /// Total size of the mapped block, including the header and user payload
+    /// area.
     pub mmap_size: usize,
 }
 
+///
+/// `current_block` points at the header for the active block.
+/// `cursor` points to the next available byte inside that block.
+/// `end` points one byte past the active block.
+///  Allocations succeed quickly when the aligned cursor and requested size fit before `end`;
+///  otherwise the slow path maps and links new block.
 #[derive(Debug)]
 pub struct Arena {
+    /// Header for the block that receives new allocations.
     pub current_block: *mut BlockHeader,
+
+    /// Next allocation position inside the current block.
     pub cursor: *mut u8,
+
+    /// One-past-the-end pointer for the current block.
     pub end: *mut u8,
+
+    /// Controls whether the next growth should double the current block size.
+    ///
+    /// After `reset`, the arena keeps the current block and disables immediate
+    /// doubling for the next growth. This avoids growing too aggressively after
+    /// a reset cycle.
     pub double_allowed: bool,
 }
+
+/// Wrapper that allows the static empty sentinel to satisfy `Sync`.
+///
+/// The sentinel is used as a stable block-chain terminator before the arena has
+/// mapped any real memory.
 pub struct EmptyBlockWrapper(BlockHeader);
 unsafe impl Sync for EmptyBlockWrapper {}
 unsafe impl Sync for BlockHeader {}
 
+/// Static sentinel used by empty arenas and as the tail of every block chain.
+///
+/// A newly created arena points at this value instead of mapping memory
+/// immediately. The first real allocation replaces it with an in-band
+/// `BlockHeader`.
 pub static EMPTY_BLOCK: EmptyBlockWrapper = EmptyBlockWrapper(BlockHeader {
     prev: null_mut(),
     mmap_ptr: null_mut(),
@@ -30,14 +86,21 @@ pub static EMPTY_BLOCK: EmptyBlockWrapper = EmptyBlockWrapper(BlockHeader {
 });
 
 impl EmptyBlockWrapper {
+    /// Returns a raw pointer to the sentinel block header.
     pub fn get(&self) -> *mut BlockHeader {
         &self.0 as *const BlockHeader as *mut BlockHeader
     }
+
+    /// Returns the sentinel mapping pointer.
+    ///
+    /// For the empty sentinel this is null, which makes a fresh arena's
+    /// `cursor` and `end` null until the first allocation maps a real block.
     pub fn get_ptr(&self) -> *mut u8 {
         self.0.mmap_ptr
     }
 }
 impl BlockHeader {
+    /// Builds metadata for a freshly mapped block.
     fn new(prev: *mut BlockHeader, mmap_ptr: *mut u8, mmap_size: usize) -> Self {
         Self {
             prev,
@@ -45,18 +108,28 @@ impl BlockHeader {
             mmap_size,
         }
     }
+
+    /// Returns the previous block in the chain.
     fn prev(&self) -> *mut BlockHeader {
         self.prev
     }
+
+    /// Returns the base address of this block's mapping.
     fn ptr(&self) -> *mut u8 {
         self.mmap_ptr
     }
+
+    /// Returns the total mapping size for this block.
     fn size(&self) -> usize {
         self.mmap_size
     }
 }
 
 impl Arena {
+    /// Creates an empty arena without mapping memory.
+    ///
+    /// The arena starts at `EMPTY_BLOCK`; the first successful allocation maps
+    /// the initial real block.
     pub fn new() -> Self {
         Self {
             current_block: EMPTY_BLOCK.get() as *const BlockHeader as *mut BlockHeader,
@@ -66,10 +139,21 @@ impl Arena {
         }
     }
 
+    /// Allocates raw memory for `layout`, panicking on allocation failure.
+    ///
+    /// This is the convenience layer over `try_allocate`. Core allocation
+    /// errors are represented by `AllocatorError` in the fallible API, while
+    /// this method converts those errors into panics.
     pub fn alloc(&mut self, layout: Layout) -> *mut u8 {
         Self::try_allocate(self, layout).unwrap_or_else(|err| err.panic())
     }
 
+    /// Allocates space for one `T`, moves `val` into arena memory, and returns
+    /// a typed raw pointer to it.
+    ///
+    /// The arena does not currently track destructors, so values that need
+    /// `Drop` will not be automatically destroyed by `reset`, `clear`, or
+    /// `Drop`.
     pub fn alloc_val<T>(&mut self, val: T) -> *mut T {
         let layout = Layout::new::<T>();
         let ptr = self.alloc(layout) as *mut T;
@@ -79,6 +163,11 @@ impl Arena {
         ptr
     }
 
+    /// Attempts to allocate raw memory for `layout`.
+    ///
+    /// A zero-sized layout is rejected by this allocator. Non-zero allocations
+    /// first try the current block's fast bump path, then fall back to mapping a
+    /// new block if the current block has insufficient space.
     pub fn try_allocate(&mut self, layout: Layout) -> Result<*mut u8, AllocatorError> {
         let (size, align) = (layout.size(), layout.align());
         debug_assert!(
@@ -97,6 +186,26 @@ impl Arena {
         }
     }
 
+    /// Attempts to satisfy an allocation from the current block only.
+    ///
+    /// The cursor is rounded up to the requested alignment. If the allocation
+    /// fits before `end`, the cursor advances and the aligned pointer is
+    /// returned. If not, the method returns `None` so the slow path can grow the
+    /// arena.
+    ///
+    /// ```text
+    ///                 Cursor                End                                       Cursor  End
+    ///                    |                   |                                          |       |
+    ///                    v                   v                                          v       v
+    /// +------+-----+-----+-------------------+  Allocate C   +------+-----+-----+-------+---------+
+    /// |Header|  A  |  B  |       free        | ------------> |Header|  A  |  B  |   C   |  free   |
+    /// +------+-----+-----+-------------------+               +------+-----+-----+-------+---------+
+    ///
+    /// ^                                      ^
+    /// +--------------------------------------+
+    ///
+    ///       Arena block of 4096 byte
+    /// ```
     pub fn try_allocate_fast(&mut self, size: usize, align: usize) -> Option<*mut u8> {
         let aligned_cursor = match Self::align_up(self.cursor as usize, align) {
             Some(ac) => ac,
@@ -117,6 +226,39 @@ impl Arena {
         }
     }
 
+    /// Allocates a new block and retries an allocation that did not fit in the
+    /// current block.
+    ///
+    /// The new block is page-aligned in size and large enough for the requested
+    /// allocation, the block header, and worst-case alignment padding. When
+    /// allowed, growth doubles the previous block size; otherwise it uses the
+    /// request size rounded to at least one page.
+    ///
+    ///
+    /*
+                                                                                      No enough
+                             Cursor      End                                          memory for D
+                                |         |    Allocate D                                  |
+                                v         v        of                                      v
+     +------+-----+-----+-------+---------+    2048 byte   +------+-----+-----+-------+---------+
+     |Header|  A  |  B  |   C   |  free   |  ------------> |Header|  A  |  B  |   C   |  free   |
+     +------+-----+-----+-------+---------+                +------+-----+-----+-------+---------+
+                                     ^                        ^
+                                     |                        |               |
+                    1024 byte  ------+                        |               | Request new
+                                                       +------+               | memory block   End
+                                                     Prev                     v                 |
+                                                      ptr                                       v
+                                                       |   +------+---------+-------------------+
+                                                       +---|Header|    D    |       free        |
+                                                           +------+---------+-------------------+
+                                                                            ^
+                                                                            |
+                                                                          Cursor
+    */
+    ///
+    ///
+    ///
     pub fn try_allocate_slow(
         &mut self,
         size: usize,
@@ -125,8 +267,8 @@ impl Arena {
         let prev_block_header = self.current_block;
         let prev_block_size = unsafe { (*self.current_block).size() };
         let aligned_requested_size = Self::align_up(
-            size + size_of::<BlockHeader>() + (align - 1), // total size
-            Platform::get_page_size(),                     // align to page_size (4KIB on Linux)
+            size + size_of::<BlockHeader>() + (align - 1),
+            Platform::get_page_size(),
         )
         .unwrap_or_else(|| AllocatorError::Overflow.panic());
         let new_block_size;
@@ -146,6 +288,7 @@ impl Arena {
         }
     }
 
+    /// Maps a new block and installs its metadata as the current block.
     fn new_block(
         &mut self,
         new_block_size: usize,
@@ -162,16 +305,40 @@ impl Arena {
         Ok(())
     }
 
+    /// Writes an in-band block header at the beginning of a mapped block.
+    ///
+    /// After the header is written, the cursor is moved to the first payload
+    /// address after the aligned header area, and `current_block` points at the
+    /// newly written header.
     fn write_metadata(&mut self, block_header: BlockHeader) {
         let header_ptr = block_header.ptr() as *mut BlockHeader;
         unsafe {
-            //
             self.reset_cursor_to(&block_header);
             header_ptr.write(block_header);
             self.current_block = header_ptr;
         }
     }
 
+    /// Releases older blocks and rewinds the current block for reuse.
+    ///
+    /// The latest block is kept because it is often the largest block reached
+    /// by the previous allocation phase. Its `prev` link is reset to
+    /// `EMPTY_BLOCK` so later drops do not walk into unmapped memory.
+    ///
+    ///
+    /*
+                                  Cursor                            Cursor
+                                     |                                 |
+                                     v                                 v
+     +------+-----+-------+----------+----+  reset   +------+----------+------------------+
+     |Header|4KIB | 8KIB  |  16KIB   |free| -------> |Header|  16KIB   |       free       |
+     +------+-----+-------+----------+----+          +------+----------+------------------+
+
+
+    */
+    ///
+    ///
+    ///
     pub fn reset(&mut self) {
         unsafe {
             self.deallocate_blocks_until_stop((*self.current_block).prev(), EMPTY_BLOCK.get());
@@ -181,6 +348,7 @@ impl Arena {
         self.double_allowed = false;
     }
 
+    /// Releases blocks from `current_block` backward until `stop_block`.
     fn deallocate_blocks_until_stop(
         &mut self,
         current_block: *mut BlockHeader,
@@ -196,10 +364,12 @@ impl Arena {
         }
     }
 
+    /// Unmaps one block.
     fn dealloc(&self, block: &BlockHeader) {
         Platform::munmap(block.ptr(), block.size());
     }
 
+    /// Places the cursor at the first payload byte after a block header.
     fn reset_cursor_to(&mut self, block: &BlockHeader) {
         unsafe {
             self.cursor = block.ptr().add(Self::align_up_unchecked(
@@ -208,25 +378,100 @@ impl Arena {
             ))
         }
     }
-    fn clear(&mut self) {
+
+    /// Releases every mapped block and returns the arena to the empty sentinel
+    /// state.
+    pub fn clear(&mut self) {
         self.deallocate_blocks_until_stop(self.current_block, EMPTY_BLOCK.get());
         self.cursor = EMPTY_BLOCK.get_ptr();
         self.end = EMPTY_BLOCK.get_ptr();
     }
 
-    pub fn align_up(size: usize, align: usize) -> Option<usize> {
+    /// Rounds `size` up to the next multiple of `align`.
+    ///
+    /// `align` must be a power of two. Overflow returns `None`.
+    #[inline(always)]
+    fn align_up(size: usize, align: usize) -> Option<usize> {
         let checked_cursor_alignment = size.checked_add(align - 1)?;
         Some(checked_cursor_alignment & !(align - 1))
     }
 
-    pub fn align_up_unchecked(size: usize, align: usize) -> usize {
+    /// Rounds `size` up to the next multiple of `align` without checking for
+    /// overflow.
+    ///
+    /// This helper is only suitable for small internal metadata sizes where the
+    /// arithmetic is known to fit.
+    #[inline(always)]
+    fn align_up_unchecked(size: usize, align: usize) -> usize {
         (size + align - 1) & !(align - 1)
     }
+
+    /// Returns whether `ptr` points at the most recent allocation of `size`
+    /// bytes.
+    ///
+    /// In a bump allocator, only the most recent allocation can be resized in
+    /// place, because only that allocation ends exactly at the cursor.
+    #[inline(always)]
     pub fn is_last_allocation(&self, ptr: *mut u8, size: usize) -> bool {
         unsafe { ptr == self.cursor.sub(size) }
     }
+
+    /// Resizes an allocation to a larger layout.
+    ///
+    /// If the allocation is the last one in the current block and the new size
+    /// fits, the cursor is advanced and the same pointer is returned. Otherwise
+    /// a new allocation is made, the old bytes are copied into it, and the new
+    /// pointer is returned. The old allocation is not individually freed; it
+    /// remains part of the arena until `reset`, `clear`, or `Drop`.
+    ///
+    /*
+
+    Attempts to grow the most recent allocation in place by extending it
+    into adjacent free space within the current block. Only possible when
+    `ptr` is the last allocation made and the alignment is compatible;
+    otherwise falls back to a fresh allocation + copy.
+
+                            Cursor (old)    End
+                                |            |
+                                v            v
+     +------+-----+-----+------+-------------+
+     |Header|  A  |  B  |  C   |    free     |
+     +------+-----+-----+------+-------------+
+                          ^
+                          |
+                    grow(C, old_size=64, new_size=192)
+                    C is the LAST allocation, room available
+                          |
+                          v
+                                            Cursor   End
+                                               |      |
+                                               v      v
+     +------+-----+-----+-----------------------+-----+
+     |Header|  A  |  B  |   C (grown in place)  |free |
+     +------+-----+-----+-----------------------+-----+
+                          ^
+                          no copy needed. same pointer returned,
+                          cursor just moves further
+
+     if C is NOT the last allocation (e.g. B instead)
+
+     +------+-----+-----+------+-------------+
+     |Header|  A  |  B  |  C   |    free     |
+     +------+-----+-----+------+-------------+
+                   ^
+                   grow(B, ...) — something (C) is already allocated
+                   after B, cannot extend in place
+                   |
+                   v
+     fallback: allocate fresh block elsewhere, copy B's data, return new ptr
+
+     +------+-----+-----+------+------------------------+-----+
+     |Header|  A  |  B  |  C   |   B (grown, relocated) | free|
+     +------+-----+-----+------+------------------------+-----+
+                   ^ old B bytes now wasted/unreachable
+    */
     pub fn grow(&mut self, ptr: *mut u8, old_layout: Layout, new_layout: Layout) -> *mut u8 {
-        // check if the align valid or not
+        // check if the alin valid or not
         let is_valid_align = old_layout.align() >= new_layout.align();
         if is_valid_align && self.is_last_allocation(ptr, old_layout.size()) {
             let delta = new_layout.size() - old_layout.size();
@@ -240,9 +485,46 @@ impl Arena {
             return new_ptr;
         }
     }
-    pub fn shrink(&mut self, ptr: *mut u8, old_layout: Layout, new_layout: Layout) {
+
+    /// Resizes an allocation to a smaller layout.
+    ///
+    /// If the allocation is the last one in the current block and the new
+    /// layout has compatible alignment, the cursor moves backward and the
+    /// released tail space becomes available for future allocations. If the
+    /// allocation is not last, shrinking is a logical no-op for the arena and
+    /// memory is reclaimed only by `reset`, `clear`, or `Drop`.
+    ///
+    /*
+                                            Cursor   End
+                                               |      |
+                                               v      v
+    +------+-----+-----+-----------------------+------+
+    |Header|  A  |  B  |   C (size=192)        | free |
+    +------+-----+-----+-----------------------+------+
+             ^
+             |
+       shrink(C, old_size=192, new_size=64)
+       C is the LAST allocation
+             |
+             v
+                            Cursor (new)               End
+                              |                         |
+                              v                         v
+    +------+-----+-----+------+-------------------------+
+    |Header|  A  |  B  |  C   |         free            |
+    +------+-----+-----+------+-------------------------+
+             ^
+             same pointer returned, cursor pulled back,
+             reclaimed tail is usable free space again
+
+
+    */
+    ///
+
+    pub fn shrink(&mut self, ptr: *mut u8, old_layout: Layout, new_layout: Layout) -> *mut u8 {
         let is_valid_to_shrink =
             new_layout.size() <= old_layout.size() && old_layout.align() >= new_layout.align();
+
         if is_valid_to_shrink && self.is_last_allocation(ptr, old_layout.size()) {
             let delta = old_layout.size() - new_layout.size();
 
@@ -255,10 +537,13 @@ impl Arena {
                 self.cursor = new_cursor;
             }
         }
+
+        ptr
     }
 }
 
 impl Drop for Arena {
+    /// Releases every mapped block owned by the arena.
     fn drop(&mut self) {
         let mut current = self.current_block;
         unsafe {
@@ -272,6 +557,7 @@ impl Drop for Arena {
 }
 
 impl std::default::Default for Arena {
+    /// Creates an empty arena.
     fn default() -> Self {
         Self::new()
     }
@@ -279,7 +565,7 @@ impl std::default::Default for Arena {
 #[cfg(test)]
 mod tests {
     use crate::alloc::AllocatorError;
-    use crate::{Arena, BlockHeader, Platform, EMPTY_BLOCK};
+    use crate::{Arena, BlockHeader, EMPTY_BLOCK, Platform};
     use std::alloc::Layout;
 
     #[test]
@@ -1419,5 +1705,436 @@ mod tests {
         arena.alloc(Layout::from_size_align(page * 64, 8).unwrap());
 
         assert_ne!(arena.current_block, large_block);
+    }
+
+    #[test]
+    fn grow_last_allocation_in_place_returns_same_pointer() {
+        let mut arena = Arena::new();
+        let old = Layout::from_size_align(64, 8).unwrap();
+        let new = Layout::from_size_align(128, 8).unwrap();
+        let ptr = arena.alloc(old);
+        let block = arena.current_block;
+
+        let grown = arena.grow(ptr, old, new);
+
+        assert_eq!(grown, ptr);
+        assert_eq!(arena.current_block, block);
+        assert_eq!(arena.cursor, unsafe { ptr.add(128) });
+    }
+
+    #[test]
+    fn grow_last_allocation_preserves_existing_bytes() {
+        let mut arena = Arena::new();
+        let old = Layout::from_size_align(128, 8).unwrap();
+        let new = Layout::from_size_align(512, 8).unwrap();
+        let ptr = arena.alloc(old);
+
+        unsafe {
+            for i in 0..old.size() {
+                *ptr.add(i) = i as u8;
+            }
+        }
+
+        let grown = arena.grow(ptr, old, new);
+
+        assert_eq!(grown, ptr);
+        unsafe {
+            for i in 0..old.size() {
+                assert_eq!(*grown.add(i), i as u8);
+            }
+        }
+    }
+
+    #[test]
+    fn grow_non_last_allocation_moves_and_preserves_bytes() {
+        let mut arena = Arena::new();
+        let old = Layout::from_size_align(128, 8).unwrap();
+        let new = Layout::from_size_align(512, 8).unwrap();
+        let first = arena.alloc(old);
+        let blocker = arena.alloc(Layout::from_size_align(64, 8).unwrap());
+
+        unsafe {
+            for i in 0..old.size() {
+                *first.add(i) = (255 - i) as u8;
+            }
+            for i in 0..64 {
+                *blocker.add(i) = 0xAB;
+            }
+        }
+
+        let grown = arena.grow(first, old, new);
+
+        assert_ne!(grown, first);
+        assert_no_overlap(
+            &[(first as usize, old.size()), (blocker as usize, 64)],
+            grown as usize,
+            new.size(),
+        );
+        unsafe {
+            for i in 0..old.size() {
+                assert_eq!(*grown.add(i), (255 - i) as u8);
+            }
+            for i in 0..64 {
+                assert_eq!(*blocker.add(i), 0xAB);
+            }
+        }
+    }
+
+    #[test]
+    fn grow_last_allocation_to_new_block_preserves_bytes() {
+        let mut arena = Arena::new();
+        let page = Platform::get_page_size();
+        let old = Layout::from_size_align(page, 8).unwrap();
+        let new = Layout::from_size_align(page * 8, 8).unwrap();
+        let ptr = arena.alloc(old);
+        let old_block = arena.current_block;
+
+        unsafe {
+            for i in 0..old.size() {
+                *ptr.add(i) = (i as u8).wrapping_mul(11);
+            }
+        }
+
+        let grown = arena.grow(ptr, old, new);
+
+        assert_ne!(arena.current_block, old_block);
+        unsafe {
+            for i in 0..old.size() {
+                assert_eq!(*grown.add(i), (i as u8).wrapping_mul(11));
+            }
+        }
+    }
+
+    #[test]
+    fn grow_with_stronger_alignment_moves_when_needed() {
+        let mut arena = Arena::new();
+        let old = Layout::from_size_align(96, 8).unwrap();
+        let new = Layout::from_size_align(192, 64).unwrap();
+        let ptr = arena.alloc(old);
+
+        unsafe {
+            for i in 0..old.size() {
+                *ptr.add(i) = i.wrapping_mul(3) as u8;
+            }
+        }
+
+        let grown = arena.grow(ptr, old, new);
+
+        assert_eq!(grown as usize % 64, 0);
+        unsafe {
+            for i in 0..old.size() {
+                assert_eq!(*grown.add(i), i.wrapping_mul(3) as u8);
+            }
+        }
+    }
+
+    #[test]
+    fn shrink_last_allocation_rewinds_cursor() {
+        let mut arena = Arena::new();
+        let old = Layout::from_size_align(256, 8).unwrap();
+        let new = Layout::from_size_align(96, 8).unwrap();
+        let ptr = arena.alloc(old);
+
+        arena.shrink(ptr, old, new);
+
+        assert_eq!(arena.cursor, unsafe { ptr.add(new.size()) });
+        assert!(arena.is_last_allocation(ptr, new.size()));
+    }
+
+    #[test]
+    fn shrink_last_allocation_then_alloc_reuses_tail() {
+        let mut arena = Arena::new();
+        let old = Layout::from_size_align(256, 8).unwrap();
+        let new = Layout::from_size_align(64, 8).unwrap();
+        let ptr = arena.alloc(old);
+
+        arena.shrink(ptr, old, new);
+        let next = arena.alloc(Layout::from_size_align(32, 8).unwrap());
+
+        assert_eq!(next, unsafe { ptr.add(new.size()) });
+    }
+
+    #[test]
+    fn shrink_non_last_allocation_keeps_cursor_unchanged() {
+        let mut arena = Arena::new();
+        let old = Layout::from_size_align(256, 8).unwrap();
+        let new = Layout::from_size_align(64, 8).unwrap();
+        let first = arena.alloc(old);
+        let second = arena.alloc(Layout::from_size_align(128, 8).unwrap());
+        let cursor = arena.cursor;
+
+        arena.shrink(first, old, new);
+
+        assert_eq!(arena.cursor, cursor);
+        assert!(arena.is_last_allocation(second, 128));
+    }
+
+    #[test]
+    fn shrink_with_stronger_alignment_is_no_op() {
+        let mut arena = Arena::new();
+        let old = Layout::from_size_align(256, 8).unwrap();
+        let new = Layout::from_size_align(64, 64).unwrap();
+        let ptr = arena.alloc(old);
+        let cursor = arena.cursor;
+
+        arena.shrink(ptr, old, new);
+
+        assert_eq!(arena.cursor, cursor);
+    }
+
+    #[test]
+    fn shrink_to_same_size_keeps_cursor() {
+        let mut arena = Arena::new();
+        let layout = Layout::from_size_align(128, 8).unwrap();
+        let ptr = arena.alloc(layout);
+        let cursor = arena.cursor;
+
+        arena.shrink(ptr, layout, layout);
+
+        assert_eq!(arena.cursor, cursor);
+    }
+
+    #[test]
+    fn grow_after_shrink_reuses_same_allocation() {
+        let mut arena = Arena::new();
+        let large = Layout::from_size_align(512, 8).unwrap();
+        let small = Layout::from_size_align(128, 8).unwrap();
+        let ptr = arena.alloc(large);
+
+        arena.shrink(ptr, large, small);
+        let grown = arena.grow(ptr, small, large);
+
+        assert_eq!(grown, ptr);
+        assert_eq!(arena.cursor, unsafe { ptr.add(large.size()) });
+    }
+
+    #[test]
+    fn grow_fallback_old_allocation_remains_readable() {
+        let mut arena = Arena::new();
+        let old = Layout::from_size_align(128, 8).unwrap();
+        let new = Layout::from_size_align(512, 8).unwrap();
+        let ptr = arena.alloc(old);
+        arena.alloc(Layout::from_size_align(64, 8).unwrap());
+
+        unsafe {
+            for i in 0..old.size() {
+                *ptr.add(i) = (i as u8).wrapping_add(7);
+            }
+        }
+
+        let grown = arena.grow(ptr, old, new);
+
+        assert_ne!(grown, ptr);
+        unsafe {
+            for i in 0..old.size() {
+                assert_eq!(*ptr.add(i), (i as u8).wrapping_add(7));
+                assert_eq!(*grown.add(i), (i as u8).wrapping_add(7));
+            }
+        }
+    }
+
+    #[test]
+    fn stress_grow_last_allocation_many_steps() {
+        let mut arena = Arena::new();
+        let mut layout = Layout::from_size_align(8, 8).unwrap();
+        let ptr = arena.alloc(layout);
+        let initialized = layout.size();
+
+        unsafe {
+            for i in 0..initialized {
+                *ptr.add(i) = 0xC1;
+            }
+        }
+
+        for size in (16..4096).step_by(16) {
+            let new_layout = Layout::from_size_align(size, 8).unwrap();
+            let grown = arena.grow(ptr, layout, new_layout);
+
+            assert_eq!(grown, ptr);
+            unsafe {
+                for i in 0..initialized {
+                    assert_eq!(*ptr.add(i), 0xC1);
+                }
+            }
+            layout = new_layout;
+        }
+    }
+
+    #[test]
+    fn stress_shrink_last_allocation_many_steps() {
+        let mut arena = Arena::new();
+        let mut layout = Layout::from_size_align(4096, 8).unwrap();
+        let ptr = arena.alloc(layout);
+
+        for size in (8..4096).rev().step_by(8) {
+            let new_layout = Layout::from_size_align(size, 8).unwrap();
+            arena.shrink(ptr, layout, new_layout);
+
+            assert_eq!(arena.cursor, unsafe { ptr.add(size) });
+            assert!(arena.is_last_allocation(ptr, size));
+            layout = new_layout;
+        }
+    }
+
+    #[test]
+    fn stress_grow_non_last_many_allocations_preserve_data() {
+        let mut arena = Arena::new();
+        let mut entries = Vec::new();
+
+        for i in 0..256 {
+            let old = Layout::from_size_align(64, 8).unwrap();
+            let ptr = arena.alloc(old);
+            arena.alloc(Layout::from_size_align(8, 8).unwrap());
+            unsafe {
+                for j in 0..old.size() {
+                    *ptr.add(j) = (i as u8).wrapping_add(j as u8);
+                }
+            }
+            entries.push((ptr, old, i as u8));
+        }
+
+        for (ptr, old, seed) in entries {
+            let new = Layout::from_size_align(256, 8).unwrap();
+            let grown = arena.grow(ptr, old, new);
+
+            assert_ne!(grown, ptr);
+            unsafe {
+                for j in 0..old.size() {
+                    assert_eq!(*grown.add(j), seed.wrapping_add(j as u8));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stress_random_grow_and_shrink_last_allocation() {
+        let mut arena = Arena::new();
+        let mut rng = Rng::new(0x600D_514E);
+
+        for _ in 0..1024 {
+            let base_size = rng.range(8, 512) as usize;
+            let align = 1usize << rng.range(3, 10);
+            let old =
+                Layout::from_size_align(Arena::align_up(base_size, align).unwrap(), align).unwrap();
+            let ptr = arena.alloc(old);
+            let grow_size = old.size() + rng.range(1, 4096) as usize;
+            let grown_layout = Layout::from_size_align(grow_size, align).unwrap();
+            let grown = arena.grow(ptr, old, grown_layout);
+            let shrink_size = rng.range(1, grown_layout.size() as u64) as usize;
+            let shrunk_layout = Layout::from_size_align(shrink_size, align).unwrap();
+
+            assert_eq!(grown, ptr);
+            arena.shrink(grown, grown_layout, shrunk_layout);
+            assert_eq!(arena.cursor, unsafe { ptr.add(shrunk_layout.size()) });
+            arena.reset();
+        }
+    }
+
+    #[test]
+    fn stress_grow_across_reset_cycles() {
+        let mut arena = Arena::new();
+        let page = Platform::get_page_size();
+
+        for cycle in 0..512 {
+            let old = Layout::from_size_align(128, 8).unwrap();
+            let new = Layout::from_size_align(page + cycle, 8).unwrap();
+            let ptr = arena.alloc(old);
+
+            unsafe {
+                for i in 0..old.size() {
+                    *ptr.add(i) = cycle as u8;
+                }
+            }
+
+            let grown = arena.grow(ptr, old, new);
+
+            unsafe {
+                for i in 0..old.size() {
+                    assert_eq!(*grown.add(i), cycle as u8);
+                }
+            }
+
+            arena.reset();
+            assert_eq!(chain_len(&arena), 1);
+        }
+    }
+
+    #[test]
+    fn stress_shrink_non_last_never_corrupts_following_allocations() {
+        let mut arena = Arena::new();
+        let mut following = Vec::new();
+
+        for i in 0..2048 {
+            let old = Layout::from_size_align(256, 8).unwrap();
+            let new = Layout::from_size_align(32, 8).unwrap();
+            let first = arena.alloc(old);
+            let second = arena.alloc(Layout::from_size_align(64, 8).unwrap());
+
+            unsafe {
+                for j in 0..64 {
+                    *second.add(j) = (i as u8).wrapping_mul(5).wrapping_add(j as u8);
+                }
+            }
+
+            arena.shrink(first, old, new);
+            following.push((second, i as u8));
+        }
+
+        for (ptr, seed) in following {
+            unsafe {
+                for j in 0..64 {
+                    assert_eq!(*ptr.add(j), seed.wrapping_mul(5).wrapping_add(j as u8));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stress_grow_fallback_with_page_sized_data() {
+        let mut arena = Arena::new();
+        let page = Platform::get_page_size();
+
+        for i in 0..128 {
+            let old = Layout::from_size_align(page, 8).unwrap();
+            let new = Layout::from_size_align(page * 2 + i, 8).unwrap();
+            let ptr = arena.alloc(old);
+            arena.alloc(Layout::from_size_align(16, 8).unwrap());
+
+            unsafe {
+                for j in 0..old.size() {
+                    *ptr.add(j) = (j as u8).wrapping_add(i as u8);
+                }
+            }
+
+            let grown = arena.grow(ptr, old, new);
+
+            unsafe {
+                for j in 0..old.size() {
+                    assert_eq!(*grown.add(j), (j as u8).wrapping_add(i as u8));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn is_last_allocation_tracks_after_alloc_grow_and_shrink() {
+        let mut arena = Arena::new();
+        let a_layout = Layout::from_size_align(64, 8).unwrap();
+        let b_layout = Layout::from_size_align(128, 8).unwrap();
+        let c_layout = Layout::from_size_align(256, 8).unwrap();
+
+        let a = arena.alloc(a_layout);
+        assert!(arena.is_last_allocation(a, a_layout.size()));
+
+        let b = arena.alloc(b_layout);
+        assert!(!arena.is_last_allocation(a, a_layout.size()));
+        assert!(arena.is_last_allocation(b, b_layout.size()));
+
+        let b_grown = arena.grow(b, b_layout, c_layout);
+        assert_eq!(b_grown, b);
+        assert!(arena.is_last_allocation(b, c_layout.size()));
+
+        arena.shrink(b, c_layout, a_layout);
+        assert!(arena.is_last_allocation(b, a_layout.size()));
     }
 }
