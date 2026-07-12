@@ -199,12 +199,11 @@ impl Arena {
     /// +------+-----+-----+-------------------+  Allocate C   +------+-----+-----+-------+---------+
     /// |Header|  A  |  B  |       free        | ------------> |Header|  A  |  B  |   C   |  free   |
     /// +------+-----+-----+-------------------+               +------+-----+-----+-------+---------+
-    ///
     /// ^                                      ^
     /// +--------------------------------------+
-    ///
     ///       An arena block of 4096 bytes
     /// ```
+    /// 
     pub fn try_allocate_fast(&mut self, size: usize, align: usize) -> Option<*mut u8> {
         let aligned_cursor = match Self::align_up(self.cursor as usize, align) {
             Some(ac) => ac,
